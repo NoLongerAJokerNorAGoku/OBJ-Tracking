@@ -1,0 +1,248 @@
+这篇文章本质上是对一个高性能detecter YOLOv2的运用。
+所以先介绍一下YOLO：You only look once (YOLO) is a state-of-the-art, real-time object detection system. On a Pascal Titan X it processes images at 30 FPS and has a mAP of 57.9% on COCO test-dev.
+作者是来自Washington Univ. 的Joseph Redmon 和Ali Farhadi，并已经演化到了第三版。作者给YOLO做的官网是 https://pjreddie.com/darknet/yolo/
+At 320 × 320 YOLOv3 runs in 22 ms at 28.2 mAP, as accurate as SSD but three times faster. When we look at the old .5 IOU mAP detection metric YOLOv3 is quite good. It achieves 57.9 AP50 in 51 ms on a Titan X, com- pared to 57.5 AP50 in 198 ms by RetinaNet, similar perfor- mance but 3.8× faster.
+
+接下来介绍的是Kalman滤波器和Hungarian算法。
+
+卡尔曼滤波器是在估计线性系统状态的过程中，以最小均方误差为目的而推导出的几个递推数学等式,也可以从贝叶斯推断的角度来推导。
+kalman滤波器的讲义：https://wenku.baidu.com/view/187eecec856a561252d36f5b.html
+本篇最后附上基于open-cv的kalman滤波对运动边框预测的实现。
+
+匈牙利方法是一种能够在多项式时间内解决分配问题(assignment problem)的组合优化算法。它由Harold Kuhn 与1955年发展并提出，由于该算法很大程度上依赖于先前两位匈牙利数学家:Denes Konig 和 Jeno Egervary,所以被命名为“匈牙利方法”。
+匈牙利算法的核心思想见链接：https://liam0205.me/2016/04/03/Hungarian-algorithm-in-the-maximum-matching-problem-of-bigraph/
+具体代码：http://www.cnblogs.com/YiXiaoZhou/p/5943775.html
+
+在本文中，对每一帧画面，用匈牙利算法对借助kalman滤波后的上一帧获取的prediction（下文中的tracker）及 用YOLO detecter获得的当前帧进行匹配。
+得到三种可能的匹配结果：
+1）Yolo detection和tracker给出的prediction相匹配（即重合区域的面积占比超过某一阈值），保留tracker
+2）tracker给出了prediction但目标位置没有相应的yolo detection（重合区域的面积占比小于某一阈值），则移除该tracker
+3）有yolo detection 但 没有相应的tracker，则在detection到的位置补一个tracker
+
+文章结果实现了对多目标的实时跟踪，基于其所采用的三个主要子算法时间复杂度都不高。文章没有就算法性能做太多横向比较。
+YOLOv3是一个可以拿来就用的好东西。
+
+
+
+
+appendix
+1）MotionFilter.h	
+#pragma once
+#include "opencv2/opencv.hpp"
+#include "opencv2/highgui/highgui.hpp"
+using namespace cv;
+
+enum MotionFilterType{KALMAN_FILTER = 0, CONDENSATION_FILTER = 1};//滤波器类型
+
+#ifndef CSST_CAMMOV_STATE
+#define  CSST_CAMMOV_STATE
+enum CamMovStat{CMS_MOVING, CMS_STOP, CMS_UNCERTEN};
+#endif
+
+//相机状态
+#ifndef CSST_CAMSTATE
+#define CSST_CAMSTATE
+class CamState
+{
+public:
+	float x;//x移动方向
+	float y;//y移动方向
+	float step;//移动补偿
+	CamMovStat state;//相机状态
+	CamState(float x=0., float y=0., float step=0.,CamMovStat state=CamMovStat::CMS_STOP)
+	{
+		this->x = x;
+		this->y = y;
+		this->state = state;
+		this->step = step;
+	}
+
+	//CamState()
+	//{
+	//	this->x = 0;
+	//	this->y = 0;
+	//	this->state = CamMovStat::CMS_STOP;
+	//	this->step = 0;
+	//}
+};
+#endif
+
+class CMotionFilter
+{
+public:
+	CMotionFilter();
+	virtual ~CMotionFilter(void);
+	// 初始化运动滤波跟踪
+	virtual bool Init(cv::Rect& inBBox) = 0;
+	// 更新运动滤波器，获得新的目标边框
+	virtual int Update(cv::Rect& inBBox, const CamState& inCamState) = 0;
+	// 获取滤波器类型，返回卡尔曼 或者Cendensation
+	virtual MotionFilterType GetFilterType(void) = 0;
+};
+
+
+
+2）MothonFilter.cpp
+
+#include "MotionFilter.h"
+CMotionFilter::CMotionFilter()
+{
+}
+CMotionFilter::~CMotionFilter(void)
+{
+}
+
+
+3）KalmanMotionFilter.h
+
+#pragma once
+#include "motionfilter.h"
+
+
+
+class CKalmanMotionFilter :
+	public CMotionFilter
+{
+public:
+	CKalmanMotionFilter();
+	~CKalmanMotionFilter(void);
+
+	// 初始化运动滤波跟踪
+	virtual bool Init(cv::Rect& inBBox);
+	// 更新运动滤波器，获得新的目标边框
+	virtual int Update(cv::Rect& inBBox, const CamState& inCamState);
+	// 获取滤波器类型，返回卡尔曼
+	virtual MotionFilterType GetFilterType(void);
+
+	void CalcCorrectPos(const CamState camst, float &xC, float &yC);
+
+private:
+	KalmanFilter m_Kalman;
+	int m_KalmanIsInit;
+	cv::Mat m_Measurement ;//Z(k)
+	cv::Mat m_Realposition ;//real X(k)
+	cv::Mat m_ControlMatrix;
+	int m_LastIdx;
+	Rect m_LastBox;
+	int m_StopFrameCount;
+	CamState m_LastCamState;//相机上一帧的状态
+	int m_CamStateCount;//用于计算相依移动修正量的权重 ，与mLastCamState变量 和 CalcCorrectPos函数配套使用
+
+};
+
+
+4）KalmanMotionFilter.cpp
+
+#include "KalmanMotionFilter.h"
+
+
+CKalmanMotionFilter::CKalmanMotionFilter(){
+}
+CKalmanMotionFilter::~CKalmanMotionFilter(void)
+{
+}
+// 初始化运动滤波跟踪
+bool CKalmanMotionFilter::Init(cv::Rect& inBBox)
+{	
+	m_Kalman.init(8,4,0);
+	m_Kalman.transitionMatrix = *(Mat_<float>(8, 8) << 1,0,0,0,1,0,0,0, 0,1,0,0,0,1,0,0, 0,0,1,0,0,0,1,0,  0,0,0,1,0,0,0,1,
+		0,0,0,0,1,0,0,0, 0,0,0,0,0,1,0,0, 0,0,0,0,0,0,1,0, 0,0,0,0,0,0,0,1);
+	setIdentity(m_Kalman.measurementMatrix,Scalar::all(1));
+	setIdentity(m_Kalman.processNoiseCov,Scalar::all(1e-5));
+	setIdentity(m_Kalman.measurementNoiseCov,Scalar::all(1e-1));
+	setIdentity(m_Kalman.errorCovPost,Scalar::all(1));
+
+
+	m_Measurement = cvCreateMat( 4, 1, CV_32FC1 );//Z(k)
+	m_Realposition = cvCreateMat( 8, 1, CV_32FC1 );//real X(k)
+	m_ControlMatrix = cvCreateMat( 8, 1, CV_32FC1 );//real X(k)
+	m_LastBox = inBBox;
+	m_Kalman.statePost = *(Mat_<float>(8,1) << inBBox.x, inBBox.y, inBBox.br().x-1, inBBox.br().y-1,0 ,0 , 0, 0);
+
+	m_KalmanIsInit = 1;
+
+	m_LastCamState = CamMovStat::CMS_STOP;
+
+	return false;
+}
+// 更新运动滤波器，获得新的目标边框
+int CKalmanMotionFilter::Update(cv::Rect& inBBox, const CamState& inCamState = CamState())
+{
+	float xCorrect = 0.0;
+	float yCorrect = 0.0;
+	CalcCorrectPos(inCamState,xCorrect, yCorrect);
+	//当相机运动的时,后验状态概率进行修正，修正量为相机的移动速度。
+	m_Kalman.statePost.at<float>(4,0)=m_Kalman.statePost.at<float>(4,0)+xCorrect;
+	m_Kalman.statePost.at<float>(5,0)=m_Kalman.statePost.at<float>(5,0)+yCorrect;
+	m_Kalman.statePost.at<float>(6,0)=m_Kalman.statePost.at<float>(6,0)+xCorrect;
+	m_Kalman.statePost.at<float>(7,0)=m_Kalman.statePost.at<float>(7,0)+yCorrect;
+
+	//相机运动的话会输入控制矩阵进行修正。
+	Mat PredictPoint = m_Kalman.predict();//预测
+	int obj_x = cvRound(PredictPoint.at<float>(0,0));
+	int obj_y = cvRound(PredictPoint.at<float>(1,0));
+	int obj_x1 = cvRound(PredictPoint.at<float>(2,0));
+	int obj_y1 = cvRound(PredictPoint.at<float>(3,0));
+
+	Rect meansureBox = Rect(inBBox.x,inBBox.y,inBBox.br().x - 1,inBBox.br().y - 1);
+	m_Realposition.at<float>(0,0)=meansureBox.x;
+	m_Realposition.at<float>(1,0)=meansureBox.y;
+	m_Realposition.at<float>(2,0)=meansureBox.width;
+	m_Realposition.at<float>(3,0)=meansureBox.height;
+	m_Realposition.at<float>(4,0)=meansureBox.x - m_LastBox.x + 1;
+	m_Realposition.at<float>(5,0)=meansureBox.y- m_LastBox.y + 1;
+	m_Realposition.at<float>(6,0)=meansureBox.width- m_LastBox.br().x + 1;
+	m_Realposition.at<float>(7,0)=meansureBox.height- m_LastBox.br().y + 1;
+	m_Measurement = m_Kalman.measurementMatrix*m_Realposition;
+	m_Kalman.correct(m_Measurement);//修正误差
+	//mLastBox = meansureBox;
+	inBBox.x = obj_x;
+	inBBox.y = obj_y;
+	inBBox.width = obj_x1 - obj_x + 1;
+	inBBox.height = obj_y1 - obj_y + 1;
+	m_LastBox = inBBox;
+
+	return 0;
+}
+
+// 获取滤波器类型，返回卡尔曼
+MotionFilterType CKalmanMotionFilter::GetFilterType(void)
+{
+	return MotionFilterType::KALMAN_FILTER;
+}
+//计算对目标的位置补偿，用于对卡尔曼预测结果进行运动补偿
+void CKalmanMotionFilter::CalcCorrectPos(const CamState camst, float &xC, float &yC)
+{
+	if (CamMovStat::CMS_MOVING == camst.state)
+	{
+		if (CamMovStat::CMS_STOP ==m_LastCamState.state && CamMovStat::CMS_MOVING == camst.state)
+		{//开始对bbox进行向后运动补偿计算
+			m_CamStateCount = 0;
+			m_LastCamState.x = camst.x;
+			m_LastCamState.y = camst.y;
+		}
+		double sigm = 1;
+		double weight = exp(-1.0*m_CamStateCount*m_CamStateCount/(sigm*sigm));
+		xC = m_LastCamState.x*weight;
+		yC = m_LastCamState.y*weight;
+		m_CamStateCount++;
+	}
+	if (CamMovStat::CMS_STOP == camst.state)
+	{
+		if (CamMovStat::CMS_MOVING ==m_LastCamState.state && CamMovStat::CMS_STOP == camst.state)
+		{//开始对bbox进行向后运动补偿计算
+			m_CamStateCount = 0;
+		}
+		double sigm = 1;
+		double weight = exp(-1.0*m_CamStateCount*m_CamStateCount/(sigm*sigm));
+		xC = -m_LastCamState.x*weight;
+		yC = -m_LastCamState.y*weight;
+		m_CamStateCount++;
+	}
+	m_LastCamState.state = camst.state;
+
+}
+参考文献
+Rudolf Emil Kalman.  “A New Approach to Linear Filtering and Prediction Problems” .http://www.cs.unc.edu/~welch/kalman/media/pdf/Kalman1960.pdf. 1960
+http://www.cs.unc.edu/~welch/kalman/ 
+http://www.cnblogs.com/cv-pr/p/4846188.html
